@@ -42,3 +42,26 @@ This approach ensures the LLM is not limited to its pre-trained knowledge and ca
 
 User Question → Embed → Retrieve (Vector DB) → Context + Question → LLM → Answer
 
+
+---
+
+## Where is RAG used?
+- Chatbots and customer support  
+- Enterprise search across PDFs, contracts, and reports  
+- Healthcare and legal assistants  
+- Finance and analytics explanations  
+
+---
+
+## Key Tools and Libraries
+- **Vector Databases**: Chroma, FAISS, Pinecone, Weaviate, Milvus  
+- **Frameworks**: LangChain, LlamaIndex, Haystack  
+- **Embedding Models**: OpenAI embeddings, SentenceTransformers, Cohere  
+- **LLMs**: GPT-4, Llama-2, Mistral  
+
+---
+
+## Summary
+RAG = knowledge retrieval + LLM reasoning.  
+It enables building assistants that are both powerful and grounded in your own data.
+
