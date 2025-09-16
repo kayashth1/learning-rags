@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script to debug RAG issues
+Test script to debug RAG issues with ClickHouse
 """
 import os
 import sys
@@ -23,10 +23,10 @@ def test_imports():
         return False
     
     try:
-        from langchain.vectorstores import Chroma
-        print("✓ Chroma imported")
+        import clickhouse_connect
+        print("✓ clickhouse_connect imported")
     except ImportError as e:
-        print(f"✗ Chroma import failed: {e}")
+        print(f"✗ clickhouse_connect import failed: {e}")
         return False
     
     try:
@@ -80,6 +80,38 @@ def test_embeddings():
         print(f"✗ Embeddings failed: {e}")
         return False
 
+def test_clickhouse_connection():
+    """Test ClickHouse connection"""
+    print("\nTesting ClickHouse connection...")
+    try:
+        import clickhouse_connect
+        
+        # Get connection details from environment or user
+        host = os.getenv("CLICKHOUSE_HOST", "localhost")
+        port = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+        user = os.getenv("CLICKHOUSE_USER", "default")
+        password = os.getenv("CLICKHOUSE_PASSWORD", "")
+        
+        if not password:
+            print("⚠️  No ClickHouse password provided. Set CLICKHOUSE_PASSWORD environment variable or provide it interactively.")
+            password = input("ClickHouse password: ").strip()
+        
+        client = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=user,
+            password=password
+        )
+        
+        # Test basic query
+        result = client.query("SELECT 1 as test")
+        print(f"✓ ClickHouse connection successful: {result.result_rows[0][0]}")
+        return True
+    except Exception as e:
+        print(f"✗ ClickHouse connection failed: {e}")
+        print("Make sure ClickHouse is running and accessible")
+        return False
+
 def test_file_loading():
     """Test loading a single file"""
     print("\nTesting file loading...")
@@ -102,12 +134,16 @@ def test_file_loading():
         return False
 
 def main():
-    print("RAG Debug Test")
+    print("RAG Debug Test with ClickHouse")
     print("=" * 50)
     
     if not test_imports():
         print("\n❌ Import test failed. Install required packages:")
-        print("pip install langchain chromadb ollama")
+        print("pip install langchain clickhouse-connect ollama")
+        return
+    
+    if not test_clickhouse_connection():
+        print("\n❌ ClickHouse test failed. Make sure ClickHouse is running and accessible.")
         return
     
     if not test_ollama_connection():
@@ -124,7 +160,7 @@ def main():
         print("\n❌ File loading test failed.")
         return
     
-    print("\n✅ All tests passed! The RAG system should work.")
+    print("\n✅ All tests passed! The RAG system with ClickHouse should work.")
 
 if __name__ == "__main__":
     main()
