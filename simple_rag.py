@@ -22,12 +22,13 @@ import json
 import random
 import string
 import clickhouse_connect
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.document_loaders import TextLoader
+from langchain_text_splitters import CharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
 from langchain.chains import RetrievalQA
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_community.llms import Ollama
-from langchain.schema import Document
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
 from typing import List, Optional
 
 DOCS_DIR = "Notes"         # folder with .txt files
@@ -89,24 +90,69 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
     """Generate multiple-choice questions based on the indexed content"""
     print(f"\nGenerating {num_questions} questions from your content...")
     
-    # Get some random chunks to base questions on
-    sample_docs = retriever.get_relevant_documents("")
+    # Get diverse chunks using multiple queries to ensure variety
+    sample_docs = []
+    queries = [
+        "general knowledge content",
+        "programming concepts",
+        "technical documentation", 
+        "tutorial content",
+        "examples and code"
+    ]
+    
+    for query in queries:
+        docs = retriever._get_relevant_documents(query)
+        sample_docs.extend(docs)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_docs = []
+    for doc in sample_docs:
+        doc_id = hash(doc.page_content)
+        if doc_id not in seen:
+            seen.add(doc_id)
+            unique_docs.append(doc)
+    
+    sample_docs = unique_docs
+    
     if not sample_docs:
         print("No documents found to generate questions from.")
         return []
     
     questions = []
-    used_content = set()
+    used_content_hashes = set()
+    max_attempts = num_questions * 3  # Allow more attempts to find unique content
+    attempts = 0
     
-    for i in range(num_questions):
+    print(f"Available document chunks: {len(sample_docs)}")
+    
+    while len(questions) < num_questions and attempts < max_attempts:
+        attempts += 1
+        
         # Get a random document chunk
         doc = random.choice(sample_docs)
-        content = doc.page_content[:500]  # Limit content length
+        content = doc.page_content[:800]  # Increased content length for better variety
+        
+        # If we're running low on unique content, try to get more diverse content
+        if len(used_content_hashes) > len(sample_docs) * 0.8:
+            print("Getting more diverse content...")
+            additional_docs = retriever._get_relevant_documents(f"content topic {attempts}")
+            for new_doc in additional_docs:
+                new_doc_id = hash(new_doc.page_content)
+                if new_doc_id not in seen:
+                    seen.add(new_doc_id)
+                    sample_docs.append(new_doc)
+        
+        # Create a hash of the content for deduplication (more reliable than exact string match)
+        content_hash = hash(content)
         
         # Skip if we've already used this content
-        if content in used_content:
+        if content_hash in used_content_hashes:
+            print(f"Attempt {attempts}: Skipping duplicate content")
             continue
-        used_content.add(content)
+        used_content_hashes.add(content_hash)
+        
+        print(f"Attempt {attempts}: Generating question from content: {content[:100]}...")
         
         # Generate question using LLM
         prompt = f"""
@@ -125,6 +171,7 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
         
         try:
             response = llm(prompt)
+            print(f"LLM Response: {response[:200]}...")
             
             # Parse the response
             lines = response.strip().split('\n')
@@ -154,13 +201,17 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
             if question_text and len(options) >= 4 and correct_answer:
                 question_json = generate_question_json(question_text, options, correct_answer, category)
                 questions.append(question_json)
-                print(f"Generated question {i+1}: {question_text[:50]}...")
+                print(f"✓ Generated question {len(questions)}: {question_text[:50]}...")
             else:
-                print(f"Failed to parse question {i+1}, skipping...")
+                print(f"✗ Failed to parse question - Question: '{question_text}', Options: {len(options)}, Correct: '{correct_answer}'")
                 
         except Exception as e:
-            print(f"Error generating question {i+1}: {e}")
+            print(f"✗ Error generating question: {e}")
             continue
+    
+    if len(questions) < num_questions:
+        print(f"Warning: Only generated {len(questions)} out of {num_questions} requested questions")
+        print(f"Used {attempts} attempts with {len(sample_docs)} available document chunks")
     
     return questions
 
@@ -247,16 +298,17 @@ class ClickHouseVectorStore:
                 # Prepare metadata
                 metadata = json.dumps(doc.metadata) if doc.metadata else "{}"
                 
-                data.append({
-                    'id': f"{doc.metadata.get('source', 'unknown')}_{hash(doc.page_content)}",
-                    'content': doc.page_content,
-                    'metadata': metadata,
-                    'source': doc.metadata.get('source', 'unknown'),
-                    'embedding': embedding
-                })
+                data.append([
+                    f"{doc.metadata.get('source', 'unknown')}_{hash(doc.page_content)}",  # id
+                    doc.page_content,  # content
+                    metadata,  # metadata
+                    doc.metadata.get('source', 'unknown'),  # source
+                    embedding  # embedding
+                    # created_at will use the DEFAULT now() value
+                ])
             
-            # Batch insert
-            self.client.insert(self.table, data)
+            # Batch insert using column names to match the table schema
+            self.client.insert(self.table, data, column_names=['id', 'content', 'metadata', 'source', 'embedding'])
             print(f"Successfully added {len(documents)} documents")
             
         except Exception as e:
@@ -302,24 +354,32 @@ class ClickHouseVectorStore:
             print(f"Error in similarity search: {e}")
             return []
     
-    def get_relevant_documents(self, query: str, k: int = 4) -> List[Document]:
-        """Get relevant documents for a query"""
-        return self.similarity_search(query, k)
-    
     def as_retriever(self, search_kwargs: dict = None):
         """Return a retriever object"""
         if search_kwargs is None:
             search_kwargs = {"k": 4}
         
-        class ClickHouseRetriever:
-            def __init__(self, vector_store, search_kwargs):
-                self.vector_store = vector_store
-                self.search_kwargs = search_kwargs
+        class ClickHouseRetriever(BaseRetriever):
+            vector_store: object
+            search_kwargs: dict
             
-            def get_relevant_documents(self, query: str) -> List[Document]:
-                return self.vector_store.get_relevant_documents(query, self.search_kwargs.get("k", 4))
+            def __init__(self, vector_store, search_kwargs):
+                super().__init__(vector_store=vector_store, search_kwargs=search_kwargs)
+            
+            def _get_relevant_documents(self, query: str) -> List[Document]:
+                """Get relevant documents for a query - this is the new abstract method"""
+                return self.vector_store.similarity_search(query, self.search_kwargs.get("k", 4))
+            
+            @property
+            def vectorstore(self):
+                """Return the vector store for compatibility"""
+                return self.vector_store
         
-        return ClickHouseRetriever(self, search_kwargs)
+        retriever = ClickHouseRetriever(self, search_kwargs)
+        print(f"Created retriever: {type(retriever)}")
+        print(f"Retriever has vector_store: {hasattr(retriever, 'vector_store')}")
+        print(f"Retriever has vectorstore: {hasattr(retriever, 'vectorstore')}")
+        return retriever
 
 def build_or_load_store(docs):
     print("Splitting documents into chunks...")
@@ -329,7 +389,7 @@ def build_or_load_store(docs):
 
     print("Initializing embeddings...")
     try:
-        embeddings = OllamaEmbeddings(model="mistral")  # you can swap to llama2, etc.
+        embeddings = OllamaEmbeddings(model="all-minilm")  # you can swap to llama2, etc.
         print("Building ClickHouse vector store (this may take a while)...")
         
         # Create ClickHouse vector store
@@ -346,7 +406,12 @@ def build_or_load_store(docs):
         # Add documents to ClickHouse
         vectordb.add_documents(split_docs)
         print("ClickHouse vector store ready!")
-        return vectordb.as_retriever(search_kwargs={"k": 4})
+        print("About to create retriever...")
+        retriever = vectordb.as_retriever(search_kwargs={"k": 4})
+        print(f"Retriever created: {type(retriever)}")
+        print(f"Retriever has vector_store: {hasattr(retriever, 'vector_store')}")
+        print("About to return retriever...")
+        return retriever
     except Exception as e:
         print(f"Error building vector store: {e}")
         raise
@@ -399,6 +464,8 @@ def main():
 
         print("Building vectorstore...")
         retriever = build_or_load_store(docs)
+        print(f"Retriever type: {type(retriever)}")
+        print(f"Retriever attributes: {dir(retriever)}")
 
         print("Initializing LLM...")
         # Use Ollama as LLM
