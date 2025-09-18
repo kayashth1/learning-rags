@@ -21,6 +21,7 @@ import os
 import json
 import random
 import string
+import logging
 import clickhouse_connect
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_community.document_loaders import TextLoader
@@ -30,6 +31,17 @@ from langchain_community.llms import Ollama
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from typing import List, Optional
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('rag_questions.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 DOCS_DIR = "Notes"         # folder with .txt files
 QUESTIONS_FILE = "generated_questions.json"  # output file for generated questions
@@ -88,6 +100,7 @@ def generate_question_json(question_text, options, correct_answer, category="", 
 
 def generate_questions_from_content(llm, retriever, num_questions=5):
     """Generate multiple-choice questions based on the indexed content"""
+    logger.info(f"Starting question generation process for {num_questions} questions")
     print(f"\nGenerating {num_questions} questions from your content...")
     
     # Get diverse chunks using multiple queries to ensure variety
@@ -100,9 +113,18 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
         "examples and code"
     ]
     
-    for query in queries:
-        docs = retriever._get_relevant_documents(query)
-        sample_docs.extend(docs)
+    logger.info(f"Retrieving documents using {len(queries)} different query strategies")
+    for i, query in enumerate(queries):
+        logger.debug(f"Executing query {i+1}/{len(queries)}: '{query}'")
+        try:
+            docs = retriever._get_relevant_documents(query)
+            logger.debug(f"Query '{query}' returned {len(docs)} documents")
+            sample_docs.extend(docs)
+        except Exception as e:
+            logger.error(f"Error executing query '{query}': {e}")
+            continue
+    
+    logger.info(f"Retrieved {len(sample_docs)} total documents from all queries")
     
     # Remove duplicates while preserving order
     seen = set()
@@ -114,8 +136,10 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
             unique_docs.append(doc)
     
     sample_docs = unique_docs
+    logger.info(f"After deduplication: {len(sample_docs)} unique document chunks")
     
     if not sample_docs:
+        logger.warning("No documents found to generate questions from")
         print("No documents found to generate questions from.")
         return []
     
@@ -124,34 +148,45 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
     max_attempts = num_questions * 3  # Allow more attempts to find unique content
     attempts = 0
     
+    logger.info(f"Starting question generation loop with max {max_attempts} attempts")
     print(f"Available document chunks: {len(sample_docs)}")
     
     while len(questions) < num_questions and attempts < max_attempts:
         attempts += 1
+        logger.debug(f"Question generation attempt {attempts}/{max_attempts}")
         
         # Get a random document chunk
         doc = random.choice(sample_docs)
         content = doc.page_content[:800]  # Increased content length for better variety
+        logger.debug(f"Selected document chunk: {content[:100]}...")
         
         # If we're running low on unique content, try to get more diverse content
         if len(used_content_hashes) > len(sample_docs) * 0.8:
+            logger.info("Running low on unique content, retrieving additional documents")
             print("Getting more diverse content...")
-            additional_docs = retriever._get_relevant_documents(f"content topic {attempts}")
-            for new_doc in additional_docs:
-                new_doc_id = hash(new_doc.page_content)
-                if new_doc_id not in seen:
-                    seen.add(new_doc_id)
-                    sample_docs.append(new_doc)
+            try:
+                additional_docs = retriever._get_relevant_documents(f"content topic {attempts}")
+                logger.debug(f"Retrieved {len(additional_docs)} additional documents")
+                for new_doc in additional_docs:
+                    new_doc_id = hash(new_doc.page_content)
+                    if new_doc_id not in seen:
+                        seen.add(new_doc_id)
+                        sample_docs.append(new_doc)
+                logger.info(f"Added {len(additional_docs)} new unique documents to pool")
+            except Exception as e:
+                logger.error(f"Error retrieving additional documents: {e}")
         
         # Create a hash of the content for deduplication (more reliable than exact string match)
         content_hash = hash(content)
         
         # Skip if we've already used this content
         if content_hash in used_content_hashes:
+            logger.debug(f"Attempt {attempts}: Skipping duplicate content (hash: {content_hash})")
             print(f"Attempt {attempts}: Skipping duplicate content")
             continue
         used_content_hashes.add(content_hash)
         
+        logger.info(f"Attempt {attempts}: Generating question from content: {content[:100]}...")
         print(f"Attempt {attempts}: Generating question from content: {content[:100]}...")
         
         # Generate question using LLM
@@ -170,7 +205,9 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
         """
         
         try:
+            logger.debug(f"Sending prompt to LLM (length: {len(prompt)} characters)")
             response = llm(prompt)
+            logger.info(f"LLM response received (length: {len(response)} characters)")
             print(f"LLM Response: {response[:200]}...")
             
             # Parse the response
@@ -180,6 +217,7 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
             correct_answer = ""
             category = ""
             
+            logger.debug(f"Parsing LLM response with {len(lines)} lines")
             for line in lines:
                 line = line.strip()
                 if line.startswith("QUESTION:"):
@@ -198,18 +236,26 @@ def generate_questions_from_content(llm, retriever, num_questions=5):
                 elif line.startswith("CATEGORY:"):
                     category = line.replace("CATEGORY:", "").strip()
             
+            logger.debug(f"Parsed question - Text: '{question_text}', Options: {len(options)}, Correct: '{correct_answer}', Category: '{category}'")
+            
             if question_text and len(options) >= 4 and correct_answer:
                 question_json = generate_question_json(question_text, options, correct_answer, category)
                 questions.append(question_json)
+                logger.info(f"Successfully generated question {len(questions)}: {question_text[:50]}...")
                 print(f"✓ Generated question {len(questions)}: {question_text[:50]}...")
             else:
+                logger.warning(f"Failed to parse question - Question: '{question_text}', Options: {len(options)}, Correct: '{correct_answer}'")
                 print(f"✗ Failed to parse question - Question: '{question_text}', Options: {len(options)}, Correct: '{correct_answer}'")
                 
         except Exception as e:
+            logger.error(f"Error generating question on attempt {attempts}: {e}", exc_info=True)
             print(f"✗ Error generating question: {e}")
             continue
     
+    logger.info(f"Question generation completed. Generated {len(questions)} out of {num_questions} requested questions")
     if len(questions) < num_questions:
+        logger.warning(f"Only generated {len(questions)} out of {num_questions} requested questions")
+        logger.info(f"Used {attempts} attempts with {len(sample_docs)} available document chunks")
         print(f"Warning: Only generated {len(questions)} out of {num_questions} requested questions")
         print(f"Used {attempts} attempts with {len(sample_docs)} available document chunks")
     

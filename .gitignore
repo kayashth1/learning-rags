@@ -1,3 +1,4 @@
 /Notes
 .venv
 __pycache__
+*.log
